@@ -5,14 +5,14 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ckpt_path', type=str, default='model')
-parser.add_argument('--exp_name', type=str, default='2VGG19_baseline_denseprogessfilter_5rgbfilter_deformable(SOTA)')
+parser.add_argument('--exp_name', type=str, default='')
 args = parser.parse_args()
 
 # dataset
-#dataset_path = '/media/guangyu/csp1/projects/CVPR2020-A2dele/test_data/NLPR/' ##gt_path
-dataset_path = '/home/guangyu/csp/projects/CVPR2020-A2dele/test_data/SIP' ##gt_path
+
+dataset_path = '/SIP' ##gt_path
 dataset_path_pre = './{}/{}/SIP'.format(args.ckpt_path, args.exp_name)  ##pre_salmap_path
-test_datasets = ['NJUD']     ##test_datasets_name
+test_datasets = ['SIP']     ##test_datasets_name
 
 # start to measure the metrics
 for dataset in test_datasets:
