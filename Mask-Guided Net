@@ -1,0 +1,260 @@
+import torch
+import numpy as np
+import torch.nn.functional as F
+from torch import nn
+from torchvision import models
+import torch.nn.init as init
+from multi_scale_module import ASPP
+from deformable_conv import DeformConv2d
+from torch.nn import Conv2d, Parameter, Softmax
+
+class rgbfilter(nn.Module):
+    
+
+    def __init__(self, num_channels):
+       
+        super(rgbfilter, self).__init__()
+        self.conv1 = DeformConv2d(num_channels, num_channels, 3,1,1)
+        self.conv2 = nn.Conv2d(num_channels, num_channels, 3,1,1)
+        
+        self.conv3 = nn.Conv2d(num_channels, 1, 1)
+        #self.conv4 = nn.Conv2d(1, 1, 1)
+        
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU()
+        
+        
+    def forward(self, input_tensor, mask):
+        
+        # spatial squeeze
+        
+        
+        batch_size, channel, a, b = input_tensor.size()
+        
+        mask = F.upsample(mask, input_tensor.size()[2:], mode='bilinear')
+        residual = self.relu(self.conv1(mask))
+        
+        out2 = self.relu(self.conv2(mask))       
+        mask_out = self.sigmoid(self.conv3(out2))
+
+        
+        output_tensor1 = input_tensor * mask_out
+      
+        output_tensor = output_tensor1 + residual
+        return output_tensor
+        
+class BasicConv2d(nn.Module):
+    def __init__(
+        self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=False,
+    ):
+        super(BasicConv2d, self).__init__()
+
+        self.basicconv = nn.Sequential(
+            nn.Conv2d(
+                in_planes,
+                out_planes,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=bias,
+            ),
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.basicconv(x)
+        
+class DenseLayer(nn.Module):
+    def __init__(self, in_C, out_C, down_factor=4, k=4):
+        """
+        
+        
+        """
+        super(DenseLayer, self).__init__()
+        self.k = k
+        self.down_factor = down_factor
+        mid_C = out_C // self.down_factor
+
+        self.down = nn.Conv2d(in_C, mid_C, 1)
+
+        self.denseblock = nn.ModuleList()
+        for i in range(1, self.k + 1):
+            self.denseblock.append(BasicConv2d(mid_C * i, mid_C, 3, 1, 1))
+
+        self.fuse = BasicConv2d(in_C + mid_C, out_C, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, in_feat):
+        down_feats = self.down(in_feat)
+        out_feats = []
+        for denseblock in self.denseblock:
+            feats = denseblock(torch.cat((*out_feats, down_feats), dim=1))
+            out_feats.append(feats)
+        feats = torch.cat((in_feat, feats), dim=1)
+        return self.fuse(feats)
+        
+
+        
+class maskfilter(nn.Module):
+    """
+    Re-implementation of SE block -- squeezing spatially and exciting channel-wise described in:
+        *Roy et al., Concurrent Spatial and Channel Squeeze & Excitation in Fully Convolutional Networks, MICCAI 2018*
+    """
+
+    def __init__(self, num_channels):
+        """
+        :param num_channels: No of input channels
+        """
+        super(maskfilter, self).__init__()
+        self.refine = DenseLayer(num_channels,num_channels)
+        self.conv1 = nn.Conv2d(num_channels, num_channels, 3,1,1)
+        
+        
+        self.conv3 = nn.Conv2d(num_channels, 1, 1)
+        
+        self.fuse = nn.Conv2d(3 * num_channels, num_channels, 3,1,1)
+        
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU()
+        
+        
+    def forward(self, depth, mask,rgb):
+        """
+        :param weights: weights for few shot learning
+        :param input_tensor: X, shape = (batch_size, num_channels, H, W)
+        :return: output_tensor
+        """
+        # spatial squeeze
+        
+        
+        #batch_size, channel, a, b = LL.size()
+        
+        mask = F.upsample(mask, depth.size()[2:], mode='bilinear')
+        mask_refine = self.refine(mask)
+        out1 = self.relu(self.conv1(mask))
+                
+        mask_out = self.sigmoid(self.conv3(out1))
+        
+        attented = depth * mask_out
+        
+        output_tensor = self.fuse(torch.cat((attented,rgb,mask_refine),1))
+        
+        return output_tensor
+                
+class RGBD_sal(nn.Module):
+    def __init__(self):
+        super(RGBD_sal, self).__init__()
+        
+        #
+        
+        feats = list(models.vgg19_bn(pretrained=True).features.children())
+        self.conv0 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.conv1 = nn.Sequential(*feats[1:6])
+        self.conv2 = nn.Sequential(*feats[6:13])
+        self.conv3 = nn.Sequential(*feats[13:26])
+        self.conv4 = nn.Sequential(*feats[26:39])
+        self.conv5 = nn.Sequential(*feats[39:52])
+        
+        self.merge1 = nn.Conv2d(512, 512, kernel_size=1, padding=0)
+        self.merge2 = nn.Conv2d(512, 256, kernel_size=1, padding=0)
+        self.merge3 = nn.Conv2d(256, 128, kernel_size=1, padding=0)
+        self.merge4 = nn.Conv2d(128, 64, kernel_size=1, padding=0)
+        
+        
+        feats_d = list(models.vgg19_bn(pretrained=True).features.children())
+        self.conv0d = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+        self.conv1d = nn.Sequential(*feats_d[1:6])
+        self.conv2d = nn.Sequential(*feats_d[6:13])
+        self.conv3d = nn.Sequential(*feats_d[13:26])
+        self.conv4d = nn.Sequential(*feats_d[26:39])
+        self.conv5d = nn.Sequential(*feats_d[39:52])
+        
+        
+        self.enhance = ASPP(512,512)
+        self.rgb_refine5 = rgbfilter(512)
+        self.rgb_refine4 = rgbfilter(512)
+        self.rgb_refine3 = rgbfilter(256)
+        self.rgb_refine2 = rgbfilter(128)
+        self.rgb_refine1 = rgbfilter(64)
+        
+        
+        self.fuse5 = maskfilter(512)
+        self.fuse4 = maskfilter(512)
+        self.fuse3 = maskfilter(256)
+        self.fuse2 = maskfilter(128)
+        self.fuse1 = maskfilter(64)
+        
+        
+        self.f1_ouput = nn.Conv2d(512, 1, kernel_size=1, padding=0)
+        self.f2_ouput = nn.Conv2d(256, 1, kernel_size=1, padding=0)
+        self.f3_ouput = nn.Conv2d(128, 1, kernel_size=1, padding=0)
+        self.f4_ouput = nn.Conv2d(64, 1, kernel_size=1, padding=0)
+        self.c5_overall_ouput=nn.Conv2d(512, 1, kernel_size=1, padding=0)
+        #self.d5_overall_ouput=nn.Conv2d(512, 1, kernel_size=1, padding=0)
+        
+        
+        
+        self.outputfinal = nn.Sequential(nn.Conv2d(64, 1, kernel_size=3, padding=1))
+        for m in self.modules():
+            if isinstance(m, nn.ReLU) or isinstance(m, nn.Dropout):
+                m.inplace = True
+
+    def forward(self, x, depth):
+        input = x
+        
+        c0 = self.conv0(x)
+        c1 = self.conv1(c0)
+        c2 = self.conv2(c1)
+        c3 = self.conv3(c2)
+        c4 = self.conv4(c3)
+        c5 = self.conv5(c4)
+        
+        d0 = self.conv0d(depth)
+        d1 = self.conv1d(d0)
+        d2 = self.conv2d(d1)
+        d3 = self.conv3d(d2)
+        d4 = self.conv4d(d3)
+        d5 = self.conv5d(d4)
+        
+        enhance_c5 = self.enhance(c5)
+        
+        c5 = self.rgb_refine5(c5,enhance_c5)
+        f0 = c5 + self.fuse5(d5,enhance_c5,c5)
+        
+        c4 = self.rgb_refine4(c4,self.merge1(f0))
+        f1 = c4  + self.fuse4(d4,self.merge1(f0),c4)
+        
+        c3 = self.rgb_refine3(c3,self.merge2(f1))
+        f2 = c3  + self.fuse3(d3,self.merge2(f1),c3)
+        
+        c2 = self.rgb_refine2(c2,self.merge3(f2))
+        f3 = c2  + self.fuse2(d2,self.merge3(f2),c2)
+        
+        c1 = self.rgb_refine1(c1,self.merge4(f3))
+        f4 = c1  + self.fuse1(d1,self.merge4(f3),c1)
+        
+        
+        f1_attention =self.f1_ouput(f1)
+        f2_attention =self.f2_ouput(f2)
+        f3_attention =self.f3_ouput(f3)
+        f4_attention =self.f4_ouput(f4)
+        c5_overall_ouput = self.c5_overall_ouput(f0)
+        
+        
+        output_final = F.upsample(self.outputfinal(f4), size=x.size()[2:], mode='bilinear')
+        
+        if self.training:
+            return output_final,c5_overall_ouput,f1_attention,f2_attention,f3_attention,f4_attention
+            
+        return torch.sigmoid(output_final)
+
+
+if __name__ == "__main__":
+    model = RGBD_sal()
+    model.cuda()
+    input = torch.autograd.Variable(torch.zeros(4, 3, 256, 256)).cuda()
+    depth = torch.autograd.Variable(torch.zeros(4, 1, 256, 256)).cuda()
+    output = model(input, depth)
+    print(output.size())
